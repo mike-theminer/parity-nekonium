@@ -133,7 +133,7 @@ export default class TransactionMainDetails extends Component {
           data-place='bottom'
           data-tip
         >
-          { totalValueDisplay } <small>ETH</small>
+          { totalValueDisplay } <small>NUKO</small>
         </div>
         <ReactTooltip id={ labelId }>
           <FormattedMessage
@@ -150,7 +150,7 @@ export default class TransactionMainDetails extends Component {
             defaultMessage='(This includes a mining fee of {fee} {token})'
             values={ {
               fee: <strong>{ feeEth }</strong>,
-              token: <small>ETH</small>
+              token: <small>NUKO</small>
             } }
           />
         </ReactTooltip>
@@ -171,7 +171,7 @@ export default class TransactionMainDetails extends Component {
           data-tip
         >
           <strong>{ valueDisplay } </strong>
-          <small>ETH</small>
+          <small>NUKO</small>
         </div>
         <ReactTooltip id={ labelId }>
           <FormattedMessage

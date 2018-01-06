@@ -23,7 +23,7 @@ const EtherValue = ({ value }, { api }) => {
   return (
     <span>
       {ether.toFormat(5)}
-      <small> ETH</small>
+      <small> NUKO</small>
     </span>
   );
 };

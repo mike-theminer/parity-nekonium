@@ -23,7 +23,7 @@ import apiutil from '@parity/api/lib/util';
 import { Balance } from './balance';
 
 const TOKENS = {
-  'eth': { tag: 'ETH' },
+  'eth': { tag: 'NUKO' },
   'gav': { tag: 'GAV', format: 1 },
   'tst': { tag: 'TST', format: 1 }
 };

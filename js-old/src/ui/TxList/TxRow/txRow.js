@@ -164,7 +164,7 @@ class TxRow extends Component {
 
     return (
       <div className={ styles.value }>
-        { value.toFormat(5) }<small>ETH</small>
+        { value.toFormat(5) }<small>NUKO</small>
       </div>
     );
   }

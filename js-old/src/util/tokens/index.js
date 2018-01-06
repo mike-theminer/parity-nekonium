@@ -30,9 +30,9 @@ export const ETH_TOKEN = {
   format: new BigNumber(10).pow(18),
   id: getTokenId('eth_native_token'),
   image: imagesEthereum,
-  name: 'Ethereum',
+  name: 'Nekonium',
   native: true,
-  tag: 'ETH'
+  tag: 'Nuko'
 };
 
 export function fetchTokenIds (tokenregInstance) {

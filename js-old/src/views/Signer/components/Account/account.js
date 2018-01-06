@@ -78,7 +78,7 @@ export default class Account extends Component {
     const { balanceDisplay } = this.state;
 
     return (
-      <span> <strong>{ balanceDisplay }</strong> <small>ETH</small></span>
+      <span> <strong>{ balanceDisplay }</strong> <small>NUKO</small></span>
     );
   }
 

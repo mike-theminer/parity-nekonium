@@ -239,7 +239,7 @@ export default class TypedInput extends Component {
       <div className={ styles.ethInput }>
         <div className={ styles.input }>
           { input }
-          { isEth ? (<div className={ styles.label }>ETH</div>) : null }
+          { isEth ? (<div className={ styles.label }>NUKO</div>) : null }
         </div>
         <div className={ styles.toggle }>
           <Toggle

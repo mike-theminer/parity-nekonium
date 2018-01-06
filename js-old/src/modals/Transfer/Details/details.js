@@ -115,7 +115,7 @@ export default class Details extends Component {
               error={ totalError }
             >
               <div className={ styles.inputoverride }>
-                { total }<small> ETH</small>
+                { total }<small> NUKO</small>
               </div>
             </Input>
           </div>
