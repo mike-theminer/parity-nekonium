@@ -21,11 +21,11 @@ use std::sync::Arc;
 
 use ethcore::blockchain_info::BlockChainInfo;
 use ethcore::client::{BlockChainClient, ProvingBlockChainClient};
-use ethcore::transaction::PendingTransaction;
-use ethcore::ids::BlockId;
 use ethcore::encoded;
-use bigint::hash::H256;
+use ethcore::ids::BlockId;
+use ethereum_types::H256;
 use parking_lot::RwLock;
+use transaction::PendingTransaction;
 
 use cht::{self, BlockInfo};
 use client::{LightChainClient, AsLightClient};
@@ -54,6 +54,7 @@ pub trait Provider: Send + Sync {
 	/// results within must adhere to the `skip` and `reverse` parameters.
 	fn block_headers(&self, req: request::CompleteHeadersRequest) -> Option<request::HeadersResponse> {
 		use request::HashOrNumber;
+		const MAX_HEADERS_TO_SEND: u64 = 512;
 
 		if req.max == 0 { return None }
 
@@ -82,10 +83,12 @@ pub trait Provider: Send + Sync {
 			}
 		};
 
-		let headers: Vec<_> = (0u64..req.max as u64)
-			.map(|x: u64| x.saturating_mul(req.skip + 1))
+		let max = ::std::cmp::min(MAX_HEADERS_TO_SEND, req.max);
+
+		let headers: Vec<_> = (0u64..max)
+			.map(|x: u64| x.saturating_mul(req.skip.saturating_add(1)))
 			.take_while(|x| if req.reverse { x < &start_num } else { best_num.saturating_sub(start_num) >= *x })
-			.map(|x| if req.reverse { start_num - x } else { start_num + x })
+			.map(|x| if req.reverse { start_num.saturating_sub(x) } else { start_num.saturating_add(x) })
 			.map(|x| self.block_header(BlockId::Number(x)))
 			.take_while(|x| x.is_some())
 			.flat_map(|x| x)
@@ -260,7 +263,7 @@ impl<T: ProvingBlockChainClient + ?Sized> Provider for T {
 	}
 
 	fn transaction_proof(&self, req: request::CompleteExecutionRequest) -> Option<request::ExecutionResponse> {
-		use ethcore::transaction::Transaction;
+		use transaction::Transaction;
 
 		let id = BlockId::Hash(req.block_hash);
 		let nonce = match self.nonce(&req.from, id.clone()) {

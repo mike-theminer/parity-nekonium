@@ -30,16 +30,15 @@ use v1::types::{ConfirmationResponse, RichRawTransaction};
 use v1::tests::helpers::TestMinerService;
 use v1::tests::mocked::parity;
 
-use bigint::prelude::U256;
-use util::Address;
+use ethereum_types::{U256, Address};
 use bytes::ToPretty;
-use ethkey::Secret;
 use ethcore::account_provider::AccountProvider;
 use ethcore::client::TestBlockChainClient;
-use ethcore::transaction::{Transaction, Action, SignedTransaction};
+use ethkey::Secret;
 use ethstore::ethkey::{Generator, Random};
-use serde_json;
 use parking_lot::Mutex;
+use serde_json;
+use transaction::{Transaction, Action, SignedTransaction};
 
 use parity_reactor::Remote;
 
@@ -61,7 +60,7 @@ impl Default for SigningTester {
 		let reservations = Arc::new(Mutex::new(nonce::Reservations::new()));
 		let mut io = IoHandler::default();
 
-		let dispatcher = FullDispatcher::new(client.clone(), miner.clone(), reservations);
+		let dispatcher = FullDispatcher::new(client.clone(), miner.clone(), reservations, 50);
 
 		let remote = Remote::new_thread_per_future();
 
@@ -111,7 +110,8 @@ fn should_add_sign_to_queue() {
 	::std::thread::spawn(move || loop {
 		if signer.requests().len() == 1 {
 			// respond
-			signer.request_confirmed(1.into(), Ok(ConfirmationResponse::Signature(0.into())));
+			let sender = signer.take(&1.into()).unwrap();
+			signer.request_confirmed(sender, Ok(ConfirmationResponse::Signature(0.into())));
 			break
 		}
 		::std::thread::sleep(Duration::from_millis(100))
@@ -189,7 +189,8 @@ fn should_check_status_of_request_when_its_resolved() {
 		"id": 1
 	}"#;
 	tester.io.handle_request_sync(&request).expect("Sent");
-	tester.signer.request_confirmed(1.into(), Ok(ConfirmationResponse::Signature(1.into())));
+	let sender = tester.signer.take(&1.into()).unwrap();
+	tester.signer.request_confirmed(sender, Ok(ConfirmationResponse::Signature(1.into())));
 
 	// This is not ideal, but we need to give futures some time to be executed, and they need to run in a separate thread
 	thread::sleep(Duration::from_millis(20));
@@ -260,7 +261,8 @@ fn should_add_transaction_to_queue() {
 	::std::thread::spawn(move || loop {
 		if signer.requests().len() == 1 {
 			// respond
-			signer.request_confirmed(1.into(), Ok(ConfirmationResponse::SendTransaction(0.into())));
+			let sender = signer.take(&1.into()).unwrap();
+			signer.request_confirmed(sender, Ok(ConfirmationResponse::SendTransaction(0.into())));
 			break
 		}
 		::std::thread::sleep(Duration::from_millis(100))
@@ -318,12 +320,12 @@ fn should_add_sign_transaction_to_the_queue() {
 		r#""input":"0x","# +
 		r#""nonce":"0x1","# +
 		&format!("\"publicKey\":\"0x{:?}\",", t.public_key().unwrap()) +
-		&format!("\"r\":\"0x{}\",", U256::from(signature.r()).to_hex()) +
+		&format!("\"r\":\"0x{:x}\",", U256::from(signature.r())) +
 		&format!("\"raw\":\"0x{}\",", rlp.to_hex()) +
-		&format!("\"s\":\"0x{}\",", U256::from(signature.s()).to_hex()) +
-		&format!("\"standardV\":\"0x{}\",", U256::from(t.standard_v()).to_hex()) +
+		&format!("\"s\":\"0x{:x}\",", U256::from(signature.s())) +
+		&format!("\"standardV\":\"0x{:x}\",", U256::from(t.standard_v())) +
 		r#""to":"0xd46e8dd67c5d32be8058bb8eb970870f07244567","transactionIndex":null,"# +
-		&format!("\"v\":\"0x{}\",", U256::from(t.original_v()).to_hex()) +
+		&format!("\"v\":\"0x{:x}\",", U256::from(t.original_v())) +
 		r#""value":"0x9184e72a""# +
 		r#"}},"id":1}"#;
 
@@ -336,7 +338,8 @@ fn should_add_sign_transaction_to_the_queue() {
 	::std::thread::spawn(move || loop {
 		if signer.requests().len() == 1 {
 			// respond
-			signer.request_confirmed(1.into(), Ok(ConfirmationResponse::SignTransaction(
+			let sender = signer.take(&1.into()).unwrap();
+			signer.request_confirmed(sender, Ok(ConfirmationResponse::SignTransaction(
 				RichRawTransaction::from_signed(t.into(), 0x0, u64::max_value())
 			)));
 			break
@@ -443,7 +446,8 @@ fn should_add_decryption_to_the_queue() {
 	::std::thread::spawn(move || loop {
 		if signer.requests().len() == 1 {
 			// respond
-			signer.request_confirmed(1.into(), Ok(ConfirmationResponse::Decrypt(vec![0x1, 0x2].into())));
+			let sender = signer.take(&1.into()).unwrap();
+			signer.request_confirmed(sender, Ok(ConfirmationResponse::Decrypt(vec![0x1, 0x2].into())));
 			break
 		}
 		::std::thread::sleep(Duration::from_millis(10))

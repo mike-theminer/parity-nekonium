@@ -21,7 +21,7 @@
 
 use std::cell::{RefCell, RefMut};
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, BTreeMap, HashSet};
+use std::collections::{HashMap, BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use hash::{KECCAK_NULL_RLP, KECCAK_EMPTY};
@@ -40,11 +40,11 @@ use executed::{Executed, ExecutionError};
 use types::state_diff::StateDiff;
 use transaction::SignedTransaction;
 use state_db::StateDB;
-use evm::{Factory as EvmFactory};
+use factory::VmFactory;
 
-use bigint::prelude::U256;
-use bigint::hash::H256;
-use util::*;
+use ethereum_types::{H256, U256, Address};
+use hashdb::{HashDB, AsHashDB};
+use kvdb::DBValue;
 use bytes::Bytes;
 
 use trie;
@@ -193,7 +193,7 @@ impl AccountEntry {
 /// `Err(ExecutionError::Internal)` indicates failure, everything else indicates
 /// a successful proof (as the transaction itself may be poorly chosen).
 pub fn check_proof(
-	proof: &[::util::DBValue],
+	proof: &[DBValue],
 	root: H256,
 	transaction: &SignedTransaction,
 	machine: &Machine,
@@ -376,7 +376,7 @@ impl<B: Backend> State<B> {
 	}
 
 	/// Get a VM factory that can execute on this state.
-	pub fn vm_factory(&self) -> EvmFactory {
+	pub fn vm_factory(&self) -> VmFactory {
 		self.factories.vm.clone()
 	}
 
@@ -604,7 +604,6 @@ impl<B: Backend> State<B> {
 	}
 
 	/// Add `incr` to the balance of account `a`.
-	#[cfg_attr(feature="dev", allow(single_match))]
 	pub fn add_balance(&mut self, a: &Address, incr: &U256, cleanup_mode: CleanupMode) -> trie::Result<()> {
 		trace!(target: "state", "add_balance({}, {}): {}", a, incr, self.balance(a)?);
 		let is_value_transfer = !incr.is_zero();
@@ -645,7 +644,7 @@ impl<B: Backend> State<B> {
 
 	/// Mutate storage of account `a` so that it is `value` for `key`.
 	pub fn set_storage(&mut self, a: &Address, key: H256, value: H256) -> trie::Result<()> {
-		trace!(target: "state", "set_storage({}:{} to {})", a, key.hex(), value.hex());
+		trace!(target: "state", "set_storage({}:{:x} to {:x})", a, key, value);
 		if self.storage_at(a, &key)? != value {
 			self.require(a, false)?.set_storage(key, value)
 		}
@@ -744,8 +743,6 @@ impl<B: Backend> State<B> {
 	}
 
 	/// Commits our cached account changes into the trie.
-	#[cfg_attr(feature="dev", allow(match_ref_pats))]
-	#[cfg_attr(feature="dev", allow(needless_borrow))]
 	pub fn commit(&mut self) -> Result<(), Error> {
 		// first, commit the sub trees.
 		let mut accounts = self.cache.borrow_mut();
@@ -836,29 +833,65 @@ impl<B: Backend> State<B> {
 		}))
 	}
 
-	fn query_pod(&mut self, query: &PodState) -> trie::Result<()> {
-		for (address, pod_account) in query.get() {
-			if !self.ensure_cached(address, RequireCache::Code, true, |a| a.is_some())? {
-				continue
+	/// Populate a PodAccount map from this state, with another state as the account and storage query.
+	pub fn to_pod_diff<X: Backend>(&mut self, query: &State<X>) -> trie::Result<PodState> {
+		assert!(self.checkpoints.borrow().is_empty());
+
+		// Merge PodAccount::to_pod for cache of self and `query`.
+		let all_addresses = self.cache.borrow().keys().cloned()
+			.chain(query.cache.borrow().keys().cloned())
+			.collect::<BTreeSet<_>>();
+
+		Ok(PodState::from(all_addresses.into_iter().fold(Ok(BTreeMap::new()), |m: trie::Result<_>, address| {
+			let mut m = m?;
+
+			let account = self.ensure_cached(&address, RequireCache::Code, true, |acc| {
+				acc.map(|acc| {
+					// Merge all modified storage keys.
+					let all_keys = {
+						let self_keys = acc.storage_changes().keys().cloned()
+							.collect::<BTreeSet<_>>();
+
+						if let Some(ref query_storage) = query.cache.borrow().get(&address)
+							.and_then(|opt| {
+								Some(opt.account.as_ref()?.storage_changes().keys().cloned()
+									 .collect::<BTreeSet<_>>())
+							})
+						{
+							self_keys.union(&query_storage).cloned().collect::<Vec<_>>()
+						} else {
+							self_keys.into_iter().collect::<Vec<_>>()
+						}
+					};
+
+					// Storage must be fetched after ensure_cached to avoid borrow problem.
+					(*acc.balance(), *acc.nonce(), all_keys, acc.code().map(|x| x.to_vec()))
+				})
+			})?;
+
+			if let Some((balance, nonce, storage_keys, code)) = account {
+				let storage = storage_keys.into_iter().fold(Ok(BTreeMap::new()), |s: trie::Result<_>, key| {
+					let mut s = s?;
+
+					s.insert(key, self.storage_at(&address, &key)?);
+					Ok(s)
+				})?;
+
+				m.insert(address, PodAccount {
+					balance, nonce, storage, code
+				});
 			}
 
-			// needs to be split into two parts for the refcell code here
-			// to work.
-			for key in pod_account.storage.keys() {
-				self.storage_at(address, key)?;
-			}
-		}
-
-		Ok(())
+			Ok(m)
+		})?))
 	}
 
 	/// Returns a `StateDiff` describing the difference from `orig` to `self`.
 	/// Consumes self.
-	pub fn diff_from<X: Backend>(&self, orig: State<X>) -> trie::Result<StateDiff> {
+	pub fn diff_from<X: Backend>(&self, mut orig: State<X>) -> trie::Result<StateDiff> {
 		let pod_state_post = self.to_pod();
-		let mut state_pre = orig;
-		state_pre.query_pod(&pod_state_post)?;
-		Ok(pod_state::diff_pod(&state_pre.to_pod(), &pod_state_post))
+		let pod_state_pre = orig.to_pod_diff(self)?;
+		Ok(pod_state::diff_pod(&pod_state_pre, &pod_state_post))
 	}
 
 	// load required account data from the databases.
@@ -1068,9 +1101,7 @@ mod tests {
 	use hash::keccak;
 	use super::*;
 	use ethkey::Secret;
-	use bigint::prelude::U256;
-	use bigint::hash::H256;
-	use util::Address;
+	use ethereum_types::{H256, U256, Address};
 	use tests::helpers::*;
 	use machine::EthereumMachine;
 	use vm::EnvInfo;
@@ -1409,7 +1440,7 @@ mod tests {
 	}
 
 	#[test]
-	fn should_not_trace_delegatecall() {
+	fn should_trace_delegatecall_properly() {
 		init_log();
 
 		let mut state = get_temp_state();
@@ -1429,7 +1460,7 @@ mod tests {
 		}.sign(&secret(), None);
 
 		state.init_code(&0xa.into(), FromHex::from_hex("6000600060006000600b618000f4").unwrap()).unwrap();
-		state.init_code(&0xb.into(), FromHex::from_hex("6000").unwrap()).unwrap();
+		state.init_code(&0xb.into(), FromHex::from_hex("60056000526001601ff3").unwrap()).unwrap();
 		let result = state.apply(&info, &machine, &t, true).unwrap();
 
 		let expected_trace = vec![FlatTrace {
@@ -1444,23 +1475,23 @@ mod tests {
 				call_type: CallType::Call,
 			}),
 			result: trace::Res::Call(trace::CallResult {
-				gas_used: U256::from(721), // in post-eip150
+				gas_used: U256::from(736), // in post-eip150
 				output: vec![]
 			}),
 		}, FlatTrace {
 			trace_address: vec![0].into_iter().collect(),
 			subtraces: 0,
 			action: trace::Action::Call(trace::Call {
-				from: "9cce34f7ab185c7aba1b7c8140d620b4bda941d6".into(),
-				to: 0xa.into(),
+				from: 0xa.into(),
+				to: 0xb.into(),
 				value: 0.into(),
 				gas: 32768.into(),
 				input: vec![],
 				call_type: CallType::DelegateCall,
 			}),
 			result: trace::Res::Call(trace::CallResult {
-				gas_used: 3.into(),
-				output: vec![],
+				gas_used: 18.into(),
+				output: vec![5],
 			}),
 		}];
 
@@ -2090,7 +2121,7 @@ mod tests {
 		let a = Address::zero();
 		state.require(&a, false).unwrap();
 		state.commit().unwrap();
-		assert_eq!(state.root().hex(), "0ce23f3c809de377b008a4a3ee94a0834aac8bec1f86e28ffe4fdb5a15b0c785");
+		assert_eq!(*state.root(), "0ce23f3c809de377b008a4a3ee94a0834aac8bec1f86e28ffe4fdb5a15b0c785".into());
 	}
 
 	#[test]
@@ -2127,7 +2158,7 @@ mod tests {
 	fn create_empty() {
 		let mut state = get_temp_state();
 		state.commit().unwrap();
-		assert_eq!(state.root().hex(), "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421");
+		assert_eq!(*state.root(), "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421".into());
 	}
 
 	#[test]
@@ -2184,5 +2215,73 @@ mod tests {
 		assert!(state.exists(&c).unwrap());
 		assert!(state.exists(&d).unwrap());
 		assert!(!state.exists(&e).unwrap());
+	}
+
+	#[test]
+	fn should_trace_diff_suicided_accounts() {
+		use pod_account;
+
+		let a = 10.into();
+		let db = get_temp_state_db();
+		let (root, db) = {
+			let mut state = State::new(db, U256::from(0), Default::default());
+			state.add_balance(&a, &100.into(), CleanupMode::ForceCreate).unwrap();
+			state.commit().unwrap();
+			state.drop()
+		};
+
+		let mut state = State::from_existing(db, root, U256::from(0u8), Default::default()).unwrap();
+		let original = state.clone();
+		state.kill_account(&a);
+
+		let diff = state.diff_from(original).unwrap();
+		let diff_map = diff.get();
+		assert_eq!(diff_map.len(), 1);
+		assert!(diff_map.get(&a).is_some());
+		assert_eq!(diff_map.get(&a),
+				   pod_account::diff_pod(Some(&PodAccount {
+					   balance: U256::from(100),
+					   nonce: U256::zero(),
+					   code: Some(Default::default()),
+					   storage: Default::default()
+				   }), None).as_ref());
+	}
+
+	#[test]
+	fn should_trace_diff_unmodified_storage() {
+		use pod_account;
+
+		let a = 10.into();
+		let db = get_temp_state_db();
+
+		let (root, db) = {
+			let mut state = State::new(db, U256::from(0), Default::default());
+			state.set_storage(&a, H256::from(&U256::from(1u64)), H256::from(&U256::from(20u64))).unwrap();
+			state.commit().unwrap();
+			state.drop()
+		};
+
+		let mut state = State::from_existing(db, root, U256::from(0u8), Default::default()).unwrap();
+		let original = state.clone();
+		state.set_storage(&a, H256::from(&U256::from(1u64)), H256::from(&U256::from(100u64))).unwrap();
+
+		let diff = state.diff_from(original).unwrap();
+		let diff_map = diff.get();
+		assert_eq!(diff_map.len(), 1);
+		assert!(diff_map.get(&a).is_some());
+		assert_eq!(diff_map.get(&a),
+				   pod_account::diff_pod(Some(&PodAccount {
+					   balance: U256::zero(),
+					   nonce: U256::zero(),
+					   code: Some(Default::default()),
+					   storage: vec![(H256::from(&U256::from(1u64)), H256::from(&U256::from(20u64)))]
+						   .into_iter().collect(),
+				   }), Some(&PodAccount {
+					   balance: U256::zero(),
+					   nonce: U256::zero(),
+					   code: Some(Default::default()),
+					   storage: vec![(H256::from(&U256::from(1u64)), H256::from(&U256::from(100u64)))]
+						   .into_iter().collect(),
+				   })).as_ref());
 	}
 }

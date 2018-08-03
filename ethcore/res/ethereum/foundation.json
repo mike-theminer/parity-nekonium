@@ -12,6 +12,9 @@
 				"homesteadTransition": "0x0",
 				"bombDefuseTransition": "0x0",
 				"eip150Transition": "0x0",
+
+				"eip161abcTransition": 100,
+				"eip161dTransition": 100,
 				"nekoniumTransition": 7777
 
 			}
@@ -23,7 +26,9 @@
 	    "minGasLimit": "0x1388",
 	    "networkID": 1,
 			"gasLimitBoundDivisor": "0x400",
-			"eip98Transition": "0x7fffffffffffffff"
+			"eip155Transition": 100,		
+			"eip98Transition": "0x7fffffffffffffff",
+		"eip86Transition": "0x7fffffffffffff"
 	  },
 	  "genesis": {
 	    "seal": {
@@ -46,6 +51,17 @@
 		              "enode://399dde242064e038c9939fb6b69f2e8886b17d1518064ee3b130f99561d4b7833f82527291c3aa70815ba07113421f862f82d85566862472c31418941d5f9b6c@52.168.133.100:28568"
 		            ],
 	  "accounts": {
+		  
+		"0000000000000000000000000000000000000001": { "builtin": { "name": "ecrecover", "pricing": { "linear": { "base": 3000, "word": 0 } } } },
+		"0000000000000000000000000000000000000002": { "builtin": { "name": "sha256", "pricing": { "linear": { "base": 60, "word": 12 } } } },
+		"0000000000000000000000000000000000000003": { "builtin": { "name": "ripemd160", "pricing": { "linear": { "base": 600, "word": 120 } } } },
+		"0000000000000000000000000000000000000004": { "builtin": { "name": "identity", "pricing": { "linear": { "base": 15, "word": 3 } } } },
+		"0000000000000000000000000000000000000005": { "builtin": { "name": "modexp", "activate_at": 4370000, "pricing": { "modexp": { "divisor": 20 } } } },
+		"0000000000000000000000000000000000000006": { "builtin": { "name": "alt_bn128_add", "activate_at": 4370000, "pricing": { "linear": { "base": 500, "word": 0 } } } },
+		"0000000000000000000000000000000000000007": { "builtin": { "name": "alt_bn128_mul", "activate_at": 4370000, "pricing": { "linear": { "base": 40000, "word": 0 } } } },
+		"0000000000000000000000000000000000000008": { "builtin": { "name": "alt_bn128_pairing", "activate_at": 4370000, "pricing": { "alt_bn128_pairing": { "base": 100000, "pair": 80000 } } } },
+		  
+		  
 	    "62a87d9716b5826063d98294688ec76f774034d6": {
 	      "balance": "6000000000000000000000000"
 	    },

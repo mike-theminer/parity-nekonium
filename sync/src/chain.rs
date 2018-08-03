@@ -92,8 +92,8 @@ use std::collections::{HashSet, HashMap};
 use std::cmp;
 use hash::keccak;
 use heapsize::HeapSizeOf;
-use bigint::prelude::U256;
-use bigint::hash::{H256, H256FastMap};
+use ethereum_types::{H256, U256};
+use plain_hasher::H256FastMap;
 use parking_lot::RwLock;
 use bytes::Bytes;
 use rlp::*;
@@ -102,10 +102,10 @@ use ethcore::header::{BlockNumber, Header as BlockHeader};
 use ethcore::client::{BlockChainClient, BlockStatus, BlockId, BlockChainInfo, BlockImportError, BlockQueueInfo};
 use ethcore::error::*;
 use ethcore::snapshot::{ManifestData, RestorationStatus};
-use ethcore::transaction::PendingTransaction;
+use transaction::PendingTransaction;
 use sync_io::SyncIo;
 use time;
-use super::SyncConfig;
+use super::{WarpSync, SyncConfig};
 use block_sync::{BlockDownloader, BlockRequest, BlockDownloaderImportError as DownloaderImportError, DownloadAction};
 use rand::Rng;
 use snapshot::{Snapshot, ChunkType};
@@ -385,7 +385,7 @@ pub struct ChainSync {
 	/// Enable ancient block downloading
 	download_old_blocks: bool,
 	/// Enable warp sync.
-	enable_warp_sync: bool,
+	warp_sync: WarpSync,
 }
 
 type RlpResponseResult = Result<Option<(PacketId, RlpStream)>, PacketDecodeError>;
@@ -394,9 +394,16 @@ impl ChainSync {
 	/// Create a new instance of syncing strategy.
 	pub fn new(config: SyncConfig, chain: &BlockChainClient) -> ChainSync {
 		let chain_info = chain.chain_info();
+		let best_block = chain.chain_info().best_block_number;
+		let state = match config.warp_sync {
+			WarpSync::Enabled => SyncState::WaitingPeers,
+			WarpSync::OnlyAndAfter(block) if block > best_block => SyncState::WaitingPeers,
+			_ => SyncState::Idle,
+		};
+
 		let mut sync = ChainSync {
-			state: if config.warp_sync { SyncState::WaitingPeers } else { SyncState::Idle },
-			starting_block: chain.chain_info().best_block_number,
+			state,
+			starting_block: best_block,
 			highest_block: None,
 			peers: HashMap::new(),
 			handshaking_peers: HashMap::new(),
@@ -410,7 +417,7 @@ impl ChainSync {
 			snapshot: Snapshot::new(),
 			sync_start_time: None,
 			transactions_stats: TransactionsStats::default(),
-			enable_warp_sync: config.warp_sync,
+			warp_sync: config.warp_sync,
 		};
 		sync.update_targets(chain);
 		sync
@@ -469,7 +476,6 @@ impl ChainSync {
 		self.peers.clear();
 	}
 
-	#[cfg_attr(feature="dev", allow(for_kv_map))] // Because it's not possible to get `values_mut()`
 	/// Reset sync. Clear all downloaded data but keep the queue
 	fn reset(&mut self, io: &mut SyncIo) {
 		self.new_blocks.reset();
@@ -509,10 +515,12 @@ impl ChainSync {
 	}
 
 	fn maybe_start_snapshot_sync(&mut self, io: &mut SyncIo) {
-		if !self.enable_warp_sync || io.snapshot_service().supported_versions().is_none() {
+		if !self.warp_sync.is_enabled() || io.snapshot_service().supported_versions().is_none() {
+			trace!(target: "sync", "Skipping warp sync. Disabled or not supported.");
 			return;
 		}
 		if self.state != SyncState::WaitingPeers && self.state != SyncState::Blocks && self.state != SyncState::Waiting {
+			trace!(target: "sync", "Skipping warp sync. State: {:?}", self.state);
 			return;
 		}
 		// Make sure the snapshot block is not too far away from best block and network best block and
@@ -521,11 +529,16 @@ impl ChainSync {
 		let fork_block = self.fork_block.as_ref().map(|&(n, _)| n).unwrap_or(0);
 
 		let (best_hash, max_peers, snapshot_peers) = {
+			let expected_warp_block = match self.warp_sync {
+				WarpSync::OnlyAndAfter(block) => block,
+				_ => 0,
+			};
 			//collect snapshot infos from peers
 			let snapshots = self.peers.iter()
 				.filter(|&(_, p)| p.is_allowed() && p.snapshot_number.map_or(false, |sn|
 					our_best_block < sn && (sn - our_best_block) > SNAPSHOT_RESTORE_THRESHOLD &&
 					sn > fork_block &&
+					sn > expected_warp_block &&
 					self.highest_block.map_or(true, |highest| highest >= sn && (highest - sn) <= SNAPSHOT_RESTORE_THRESHOLD)
 				))
 				.filter_map(|(p, peer)| peer.snapshot_hash.map(|hash| (p, hash.clone())))
@@ -555,7 +568,7 @@ impl ChainSync {
 				trace!(target: "sync", "Starting unconfirmed snapshot sync {:?} with {:?}", hash, peers);
 				self.start_snapshot_sync(io, peers);
 			}
-		} else if timeout {
+		} else if timeout && !self.warp_sync.is_warp_only() {
 			trace!(target: "sync", "No snapshots found, starting full sync");
 			self.state = SyncState::Idle;
 			self.continue_sync(io);
@@ -627,10 +640,6 @@ impl ChainSync {
 			block_set: None,
 		};
 
-		if self.sync_start_time.is_none() {
-			self.sync_start_time = Some(time::precise_time_ns());
-		}
-
 		trace!(target: "sync", "New peer {} (protocol: {}, network: {:?}, difficulty: {:?}, latest:{}, genesis:{}, snapshot:{:?})",
 			peer_id, peer.protocol_version, peer.network_id, peer.difficulty, peer.latest_hash, peer.genesis, peer.snapshot_number);
 		if io.is_expired() {
@@ -659,6 +668,10 @@ impl ChainSync {
 			return Ok(());
 		}
 
+		if self.sync_start_time.is_none() {
+			self.sync_start_time = Some(time::precise_time_ns());
+		}
+
 		self.peers.insert(peer_id.clone(), peer);
 		// Don't activate peer immediatelly when searching for common block.
 		// Let the current sync round complete first.
@@ -672,7 +685,6 @@ impl ChainSync {
 		Ok(())
 	}
 
-	#[cfg_attr(feature="dev", allow(cyclomatic_complexity, needless_borrow))]
 	/// Called by peer once it has new block headers during sync
 	fn on_peer_block_headers(&mut self, io: &mut SyncIo, peer_id: PeerId, r: &UntrustedRlp) -> Result<(), PacketDecodeError> {
 		let confirmed = match self.peers.get_mut(&peer_id) {
@@ -883,7 +895,6 @@ impl ChainSync {
 	}
 
 	/// Called by peer once it has new block bodies
-	#[cfg_attr(feature="dev", allow(cyclomatic_complexity))]
 	fn on_peer_new_block(&mut self, io: &mut SyncIo, peer_id: PeerId, r: &UntrustedRlp) -> Result<(), PacketDecodeError> {
 		if !self.peers.get(&peer_id).map_or(false, |p| p.can_sync()) {
 			trace!(target: "sync", "Ignoring new block from unconfirmed peer {}", peer_id);
@@ -1170,9 +1181,14 @@ impl ChainSync {
 				self.sync_peer(io, p, false);
 			}
 		}
-		if (self.state != SyncState::WaitingPeers && self.state != SyncState::SnapshotWaiting && self.state != SyncState::Waiting && self.state != SyncState::Idle)
-			&& !self.peers.values().any(|p| p.asking != PeerAsking::Nothing && p.block_set != Some(BlockSet::OldBlocks) && p.can_sync()) {
 
+		if
+			self.state != SyncState::WaitingPeers &&
+			self.state != SyncState::SnapshotWaiting &&
+			self.state != SyncState::Waiting &&
+			self.state != SyncState::Idle &&
+			!self.peers.values().any(|p| p.asking != PeerAsking::Nothing && p.block_set != Some(BlockSet::OldBlocks) && p.can_sync())
+		{
 			self.complete_sync(io);
 		}
 	}
@@ -1223,7 +1239,13 @@ impl ChainSync {
 		if force || higher_difficulty || self.old_blocks.is_some() {
 			match self.state {
 				SyncState::WaitingPeers => {
-					trace!(target: "sync", "Checking snapshot sync: {} vs {}", peer_snapshot_number, chain_info.best_block_number);
+					trace!(
+						target: "sync",
+						"Checking snapshot sync: {} vs {} (peer: {})",
+						peer_snapshot_number,
+						chain_info.best_block_number,
+						peer_id
+					);
 					self.maybe_start_snapshot_sync(io);
 				},
 				SyncState::Idle | SyncState::Blocks | SyncState::NewBlocks => {
@@ -1333,7 +1355,6 @@ impl ChainSync {
 	}
 
 	/// Checks if there are blocks fully downloaded that can be imported into the blockchain and does the import.
-	#[cfg_attr(feature="dev", allow(block_in_if_condition_stmt))]
 	fn collect_blocks(&mut self, io: &mut SyncIo, block_set: BlockSet) {
 		match block_set {
 			BlockSet::NewBlocks => {
@@ -1353,7 +1374,6 @@ impl ChainSync {
 	}
 
 	/// Request headers from a peer by block hash
-	#[cfg_attr(feature="dev", allow(too_many_arguments))]
 	fn request_headers_by_hash(&mut self, sync: &mut SyncIo, peer_id: PeerId, h: &H256, count: u64, skip: u64, reverse: bool, set: BlockSet) {
 		trace!(target: "sync", "{} <- GetBlockHeaders: {} entries starting from {}, set = {:?}", peer_id, count, h, set);
 		let mut rlp = RlpStream::new_list(4);
@@ -1368,7 +1388,6 @@ impl ChainSync {
 	}
 
 	/// Request headers from a peer by block number
-	#[cfg_attr(feature="dev", allow(too_many_arguments))]
 	fn request_fork_header_by_number(&mut self, sync: &mut SyncIo, peer_id: PeerId, n: BlockNumber) {
 		trace!(target: "sync", "{} <- GetForkHeader: at {}", peer_id, n);
 		let mut rlp = RlpStream::new_list(4);
@@ -1560,7 +1579,7 @@ impl ChainSync {
 		let max_count = cmp::min(MAX_HEADERS_TO_SEND, max_headers);
 		let mut count = 0;
 		let mut data = Bytes::new();
-		let inc = (skip + 1) as BlockNumber;
+		let inc = skip.saturating_add(1) as BlockNumber;
 		let overlay = io.chain_overlay().read();
 
 		while number <= last && count < max_count {
@@ -1579,10 +1598,10 @@ impl ChainSync {
 				if number <= inc || number == 0 {
 					break;
 				}
-				number -= inc;
+				number = number.saturating_sub(inc);
 			}
 			else {
-				number += inc;
+				number = number.saturating_add(inc);
 			}
 		}
 		let mut rlp = RlpStream::new_list(count as usize);
@@ -1783,7 +1802,6 @@ impl ChainSync {
 		})
 	}
 
-	#[cfg_attr(feature="dev", allow(match_same_arms))]
 	pub fn maintain_peers(&mut self, io: &mut SyncIo) {
 		let tick = time::precise_time_ns();
 		let mut aborting = Vec::new();
@@ -2227,12 +2245,11 @@ fn accepts_service_transaction(client_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
 	use std::collections::{HashSet, VecDeque};
-	use {ethkey, Address};
+	use ethkey;
 	use network::PeerId;
 	use tests::helpers::*;
 	use tests::snapshot::TestSnapshotService;
-	use bigint::prelude::U256;
-	use bigint::hash::H256;
+	use ethereum_types::{H256, U256, Address};
 	use parking_lot::RwLock;
 	use bytes::Bytes;
 	use rlp::{Rlp, RlpStream, UntrustedRlp};
@@ -2241,8 +2258,8 @@ mod tests {
 	use super::{PeerInfo, PeerAsking};
 	use ethcore::header::*;
 	use ethcore::client::{BlockChainClient, EachBlockWith, TestBlockChainClient};
-	use ethcore::transaction::UnverifiedTransaction;
 	use ethcore::miner::MinerService;
+	use transaction::UnverifiedTransaction;
 
 	fn get_dummy_block(order: u32, parent_hash: H256) -> Bytes {
 		let mut header = Header::new();

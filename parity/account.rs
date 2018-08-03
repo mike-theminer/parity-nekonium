@@ -16,7 +16,7 @@
 
 use std::path::PathBuf;
 use ethcore::ethstore::{EthStore, SecretStore, import_account, import_accounts, read_geth_accounts};
-use ethcore::ethstore::dir::RootDiskDirectory;
+use ethcore::ethstore::accounts_dir::RootDiskDirectory;
 use ethcore::ethstore::SecretVaultRef;
 use ethcore::account_provider::{AccountProvider, AccountProviderSettings};
 use helpers::{password_prompt, password_from_file};
@@ -94,7 +94,7 @@ fn new(n: NewAccount) -> Result<String, String> {
 	let secret_store = Box::new(secret_store(dir, Some(n.iterations))?);
 	let acc_provider = AccountProvider::new(secret_store, AccountProviderSettings::default());
 	let new_account = acc_provider.new_account(&password).map_err(|e| format!("Could not create new account: {}", e))?;
-	Ok(format!("0x{:?}", new_account))
+	Ok(format!("0x{:x}", new_account))
 }
 
 fn list(list_cmd: ListAccounts) -> Result<String, String> {
@@ -103,7 +103,7 @@ fn list(list_cmd: ListAccounts) -> Result<String, String> {
 	let acc_provider = AccountProvider::new(secret_store, AccountProviderSettings::default());
 	let accounts = acc_provider.accounts().map_err(|e| format!("{}", e))?;
 	let result = accounts.into_iter()
-		.map(|a| format!("0x{:?}", a))
+		.map(|a| format!("0x{:x}", a))
 		.collect::<Vec<String>>()
 		.join("\n");
 

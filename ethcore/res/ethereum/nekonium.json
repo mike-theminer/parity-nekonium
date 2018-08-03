@@ -12,6 +12,9 @@
 				"homesteadTransition": "0x0",
 				"bombDefuseTransition": "0x0",
 				"eip150Transition": "0x0",
+				"eip155Transition": 100,
+				"eip161abcTransition": 100,
+				"eip161dTransition": 100,
 				"nekoniumTransition": 7777
 
 			}
@@ -23,6 +26,12 @@
 	    "minGasLimit": "0x1388",
 	    "networkID": 1,
 			"gasLimitBoundDivisor": "0x400",
+			"eip140Transition": "0x0",	
+			"eip155Transition": 100,
+
+				"eip150Transition": "0x0",
+				"eip161abcTransition": 100,
+				"eip161dTransition": 100,				
 			"eip98Transition": "0x7fffffffffffffff"
 	  },
 	  "genesis": {

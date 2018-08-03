@@ -14,25 +14,22 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::mem;
-use std::slice::from_raw_parts;
-use std::net::{SocketAddr, ToSocketAddrs, SocketAddrV4, SocketAddrV6, Ipv4Addr, Ipv6Addr};
-use std::hash::{Hash, Hasher};
-use std::str::{FromStr};
 use std::collections::{HashMap, HashSet};
-use std::fmt::{Display, Formatter};
-use std::path::{PathBuf};
-use std::fmt;
-use std::fs;
-use std::io::{Read, Write};
-use bigint::hash::*;
+use std::fmt::{self, Display, Formatter};
+use std::hash::{Hash, Hasher};
+use std::net::{SocketAddr, ToSocketAddrs, SocketAddrV4, SocketAddrV6, Ipv4Addr, Ipv6Addr};
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::{fs, mem, slice};
+use std::time::{self, Duration, SystemTime};
+use rand::{self, Rng};
+use ethereum_types::H512;
 use rlp::*;
-use time::Tm;
 use error::{Error, ErrorKind};
 use {AllowIP, IpFilter};
 use discovery::{TableUpdates, NodeEntry};
 use ip_utils::*;
-use serde_json::Value;
+use serde_json;
 
 /// Node public key
 pub type NodeId = H512;
@@ -80,7 +77,7 @@ impl NodeEndpoint {
 			4 => Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3]), tcp_port))),
 			16 => unsafe {
 				let o: *const u16 = mem::transmute(addr_bytes.as_ptr());
-				let o = from_raw_parts(o, 8);
+				let o = slice::from_raw_parts(o, 8);
 				Ok(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::new(o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]), tcp_port, 0, 0)))
 			},
 			_ => Err(DecoderError::RlpInconsistentLengthAndData)
@@ -95,7 +92,7 @@ impl NodeEndpoint {
 			}
 			SocketAddr::V6(a) => unsafe {
 				let o: *const u8 = mem::transmute(a.ip().segments().as_ptr());
-				rlp.append(&from_raw_parts(o, 16));
+				rlp.append(&slice::from_raw_parts(o, 16));
 			}
 		};
 		rlp.append(&self.udp_port);
@@ -133,18 +130,55 @@ impl FromStr for NodeEndpoint {
 	}
 }
 
-#[derive(PartialEq, Eq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum PeerType {
 	_Required,
 	Optional
 }
 
+/// A type for representing an interaction (contact) with a node at a given time
+/// that was either a success or a failure.
+#[derive(Clone, Copy, Debug)]
+pub enum NodeContact {
+	Success(SystemTime),
+	Failure(SystemTime),
+}
+
+impl NodeContact {
+	fn success() -> NodeContact {
+		NodeContact::Success(SystemTime::now())
+	}
+
+	fn failure() -> NodeContact {
+		NodeContact::Failure(SystemTime::now())
+	}
+
+	fn time(&self) -> SystemTime {
+		match *self {
+			NodeContact::Success(t) | NodeContact::Failure(t) => t
+		}
+	}
+
+	/// Filters and old contact, returning `None` if it happened longer than a
+	/// week ago.
+	fn recent(&self) -> Option<&NodeContact> {
+		let t = self.time();
+		if let Ok(d) = t.elapsed() {
+			if d < Duration::from_secs(60 * 60 * 24 * 7) {
+				return Some(self);
+			}
+		}
+
+		None
+	}
+}
+
+#[derive(Debug)]
 pub struct Node {
 	pub id: NodeId,
 	pub endpoint: NodeEndpoint,
 	pub peer_type: PeerType,
-	pub failures: u32,
-	pub last_attempted: Option<Tm>,
+	pub last_contact: Option<NodeContact>,
 }
 
 impl Node {
@@ -153,8 +187,7 @@ impl Node {
 			id: id,
 			endpoint: endpoint,
 			peer_type: PeerType::Optional,
-			failures: 0,
-			last_attempted: None,
+			last_contact: None,
 		}
 	}
 }
@@ -184,8 +217,7 @@ impl FromStr for Node {
 			id: id,
 			endpoint: endpoint,
 			peer_type: PeerType::Optional,
-			last_attempted: None,
-			failures: 0,
+			last_contact: None,
 		})
 	}
 }
@@ -202,6 +234,9 @@ impl Hash for Node {
 		self.id.hash(state)
 	}
 }
+
+const MAX_NODES: usize = 1024;
+const NODES_FILE: &str = "nodes.json";
 
 /// Node table backed by disk file.
 pub struct NodeTable {
@@ -221,23 +256,79 @@ impl NodeTable {
 
 	/// Add a node to table
 	pub fn add_node(&mut self, mut node: Node) {
-		// preserve failure counter
-		let failures = self.nodes.get(&node.id).map_or(0, |n| n.failures);
-		node.failures = failures;
+		// preserve node last_contact
+		node.last_contact = self.nodes.get(&node.id).and_then(|n| n.last_contact);
 		self.nodes.insert(node.id.clone(), node);
 	}
 
-	/// Returns node ids sorted by number of failures
-	pub fn nodes(&self, filter: IpFilter) -> Vec<NodeId> {
-		let mut refs: Vec<&Node> = self.nodes.values().filter(|n| !self.useless_nodes.contains(&n.id) && n.endpoint.is_allowed(&filter)).collect();
-		refs.sort_by(|a, b| a.failures.cmp(&b.failures));
-		refs.iter().map(|n| n.id.clone()).collect()
+	/// Returns a list of ordered nodes according to their most recent contact
+	/// and filtering useless nodes. The algorithm for creating the sorted nodes
+	/// is:
+	/// - Contacts that aren't recent (older than 1 week) are discarded
+	/// - (1) Nodes with a successful contact are ordered (most recent success first)
+	/// - (2) Nodes with unknown contact (older than 1 week or new nodes) are randomly shuffled
+	/// - (3) Nodes with a failed contact are ordered (oldest failure first)
+	/// - The final result is the concatenation of (1), (2) and (3)
+	fn ordered_entries(&self) -> Vec<&Node> {
+		let mut success = Vec::new();
+		let mut failures = Vec::new();
+		let mut unknown = Vec::new();
+
+		let nodes = self.nodes.values()
+			.filter(|n| !self.useless_nodes.contains(&n.id));
+
+		for node in nodes {
+			// discard contact points older that aren't recent
+			match node.last_contact.as_ref().and_then(|c| c.recent()) {
+				Some(&NodeContact::Success(_)) => {
+					success.push(node);
+				},
+				Some(&NodeContact::Failure(_)) => {
+					failures.push(node);
+				},
+				None => {
+					unknown.push(node);
+				},
+			}
+		}
+
+		success.sort_by(|a, b| {
+			let a = a.last_contact.expect("vector only contains values with defined last_contact; qed");
+			let b = b.last_contact.expect("vector only contains values with defined last_contact; qed");
+			// inverse ordering, most recent successes come first
+			b.time().cmp(&a.time())
+		});
+
+		failures.sort_by(|a, b| {
+			let a = a.last_contact.expect("vector only contains values with defined last_contact; qed");
+			let b = b.last_contact.expect("vector only contains values with defined last_contact; qed");
+			// normal ordering, most distant failures come first
+			a.time().cmp(&b.time())
+		});
+
+		rand::thread_rng().shuffle(&mut unknown);
+
+		success.append(&mut unknown);
+		success.append(&mut failures);
+		success
 	}
 
-	/// Unordered list of all entries
-	pub fn unordered_entries(&self) -> Vec<NodeEntry> {
-		// preserve failure counter
-		self.nodes.values().map(|n| NodeEntry { endpoint: n.endpoint.clone(), id: n.id.clone() }).collect()
+	/// Returns node ids sorted by failure percentage, for nodes with the same failure percentage the absolute number of
+	/// failures is considered.
+	pub fn nodes(&self, filter: IpFilter) -> Vec<NodeId> {
+		self.ordered_entries().iter()
+			.filter(|n| n.endpoint.is_allowed(&filter))
+			.map(|n| n.id)
+			.collect()
+	}
+
+	/// Ordered list of all entries by failure percentage, for nodes with the same failure percentage the absolute
+	/// number of failures is considered.
+	pub fn entries(&self) -> Vec<NodeEntry> {
+		self.ordered_entries().iter().map(|n| NodeEntry {
+			endpoint: n.endpoint.clone(),
+			id: n.id.clone(),
+		}).collect()
 	}
 
 	/// Get particular node
@@ -263,14 +354,21 @@ impl NodeTable {
 		}
 	}
 
-	/// Increase failure counte for a node
+	/// Set last contact as failure for a node
 	pub fn note_failure(&mut self, id: &NodeId) {
 		if let Some(node) = self.nodes.get_mut(id) {
-			node.failures += 1;
+			node.last_contact = Some(NodeContact::failure());
 		}
 	}
 
-	/// Mark as useless, no furter attempts to connect until next call to `clear_useless`.
+	/// Set last contact as success for a node
+	pub fn note_success(&mut self, id: &NodeId) {
+		if let Some(node) = self.nodes.get_mut(id) {
+			node.last_contact = Some(NodeContact::success());
+		}
+	}
+
+	/// Mark as useless, no further attempts to connect until next call to `clear_useless`.
 	pub fn mark_as_useless(&mut self, id: &NodeId) {
 		self.useless_nodes.insert(id.clone());
 	}
@@ -282,77 +380,62 @@ impl NodeTable {
 
 	/// Save the nodes.json file.
 	pub fn save(&self) {
-		if let Some(ref path) = self.path {
-			let mut path_buf = PathBuf::from(path);
-			if let Err(e) = fs::create_dir_all(path_buf.as_path()) {
-				warn!("Error creating node table directory: {:?}", e);
-				return;
-			};
-			path_buf.push("nodes.json");
-			let mut json = String::new();
-			json.push_str("{\n");
-			json.push_str("\"nodes\": [\n");
-			let node_ids = self.nodes(IpFilter::default());
-			for i in 0 .. node_ids.len() {
-				let node = self.nodes.get(&node_ids[i]).expect("self.nodes() only returns node IDs from self.nodes");
-				json.push_str(&format!("\t{{ \"url\": \"{}\", \"failures\": {} }}{}\n", node, node.failures, if i == node_ids.len() - 1 {""} else {","}))
-			}
-			json.push_str("]\n");
-			json.push_str("}");
-			let mut file = match fs::File::create(path_buf.as_path()) {
-				Ok(file) => file,
-				Err(e) => {
-					warn!("Error creating node table file: {:?}", e);
-					return;
+		let mut path = match self.path {
+			Some(ref path) => PathBuf::from(path),
+			None => return,
+		};
+		if let Err(e) = fs::create_dir_all(&path) {
+			warn!("Error creating node table directory: {:?}", e);
+			return;
+		}
+		path.push(NODES_FILE);
+		let node_ids = self.nodes(IpFilter::default());
+		let nodes = node_ids.into_iter()
+			.map(|id| self.nodes.get(&id).expect("self.nodes() only returns node IDs from self.nodes"))
+			.take(MAX_NODES)
+			.map(|node| node.clone())
+			.map(Into::into)
+			.collect();
+		let table = json::NodeTable { nodes };
+
+		match fs::File::create(&path) {
+			Ok(file) => {
+				if let Err(e) = serde_json::to_writer_pretty(file, &table) {
+					warn!("Error writing node table file: {:?}", e);
 				}
-			};
-			if let Err(e) = file.write(&json.into_bytes()) {
-				warn!("Error writing node table file: {:?}", e);
+			},
+			Err(e) => {
+				warn!("Error creating node table file: {:?}", e);
 			}
 		}
 	}
 
 	fn load(path: Option<String>) -> HashMap<NodeId, Node> {
-		let mut nodes: HashMap<NodeId, Node> = HashMap::new();
-		if let Some(path) = path {
-			let mut path_buf = PathBuf::from(path);
-			path_buf.push("nodes.json");
-			let mut file = match fs::File::open(path_buf.as_path()) {
-				Ok(file) => file,
-				Err(e) => {
-					debug!("Error opening node table file: {:?}", e);
-					return nodes;
-				}
-			};
-			let mut buf = String::new();
-			match file.read_to_string(&mut buf) {
-				Ok(_) => {},
-				Err(e) => {
-					warn!("Error reading node table file: {:?}", e);
-					return nodes;
-				}
-			}
-			let json: Value = match ::serde_json::from_str(&buf) {
-				Ok(json) => json,
-				Err(e) => {
-					warn!("Error parsing node table file: {:?}", e);
-					return nodes;
-				}
-			};
-			if let Some(list) = json.as_object().and_then(|o| o.get("nodes")).and_then(|n| n.as_array()) {
-				for n in list.iter().filter_map(|n| n.as_object()) {
-					if let Some(url) = n.get("url").and_then(|u| u.as_str()) {
-						if let Ok(mut node) = Node::from_str(url) {
-							if let Some(failures) = n.get("failures").and_then(|f| f.as_u64()) {
-								node.failures = failures as u32;
-							}
-							nodes.insert(node.id.clone(), node);
-						}
-					}
-				}
-			}
+		let path = match path {
+			Some(path) => PathBuf::from(path).join(NODES_FILE),
+			None => return Default::default(),
+		};
+
+		let file = match fs::File::open(&path) {
+			Ok(file) => file,
+			Err(e) => {
+				debug!("Error opening node table file: {:?}", e);
+				return Default::default();
+			},
+		};
+		let res: Result<json::NodeTable, _> = serde_json::from_reader(file);
+		match res {
+			Ok(table) => {
+				table.nodes.into_iter()
+					.filter_map(|n| n.into_node())
+					.map(|n| (n.id.clone(), n))
+					.collect()
+			},
+			Err(e) => {
+				warn!("Error reading node table file: {:?}", e);
+				Default::default()
+			},
 		}
-		nodes
 	}
 }
 
@@ -364,10 +447,75 @@ impl Drop for NodeTable {
 
 /// Check if node url is valid
 pub fn validate_node_url(url: &str) -> Option<Error> {
-	use std::str::FromStr;
 	match Node::from_str(url) {
 		Ok(_) => None,
 		Err(e) => Some(e)
+	}
+}
+
+mod json {
+	use super::*;
+
+	#[derive(Serialize, Deserialize)]
+	pub struct NodeTable {
+		pub nodes: Vec<Node>,
+	}
+
+	#[derive(Serialize, Deserialize)]
+	pub enum NodeContact {
+		#[serde(rename = "success")]
+		Success(u64),
+		#[serde(rename = "failure")]
+		Failure(u64),
+	}
+
+	impl NodeContact {
+		pub fn into_node_contact(self) -> super::NodeContact {
+			match self {
+				NodeContact::Success(s) => super::NodeContact::Success(
+					time::UNIX_EPOCH + Duration::from_secs(s)
+				),
+				NodeContact::Failure(s) => super::NodeContact::Failure(
+					time::UNIX_EPOCH + Duration::from_secs(s)
+				),
+			}
+		}
+	}
+
+	#[derive(Serialize, Deserialize)]
+	pub struct Node {
+		pub url: String,
+		pub last_contact: Option<NodeContact>,
+	}
+
+	impl Node {
+		pub fn into_node(self) -> Option<super::Node> {
+			match super::Node::from_str(&self.url) {
+				Ok(mut node) => {
+					node.last_contact = self.last_contact.map(|c| c.into_node_contact());
+					Some(node)
+				},
+				_ => None,
+			}
+		}
+	}
+
+	impl<'a> From<&'a super::Node> for Node {
+		fn from(node: &'a super::Node) -> Self {
+			let last_contact = node.last_contact.and_then(|c| {
+				match c {
+					super::NodeContact::Success(t) =>
+						t.duration_since(time::UNIX_EPOCH).ok().map(|d| NodeContact::Success(d.as_secs())),
+					super::NodeContact::Failure(t) =>
+						t.duration_since(time::UNIX_EPOCH).ok().map(|d| NodeContact::Failure(d.as_secs())),
+				}
+			});
+
+			Node {
+				url: format!("{}", node),
+				last_contact
+			}
+		}
 	}
 }
 
@@ -375,7 +523,7 @@ pub fn validate_node_url(url: &str) -> Option<Error> {
 mod tests {
 	use super::*;
 	use std::net::{SocketAddr, SocketAddrV4, Ipv4Addr};
-	use bigint::hash::H512;
+	use ethereum_types::H512;
 	use std::str::FromStr;
 	use tempdir::TempDir;
 	use ipnetwork::IpNetwork;
@@ -408,26 +556,54 @@ mod tests {
 	}
 
 	#[test]
-	fn table_failure_order() {
+	fn table_last_contact_order() {
 		let node1 = Node::from_str("enode://a979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c@22.99.55.44:7770").unwrap();
 		let node2 = Node::from_str("enode://b979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c@22.99.55.44:7770").unwrap();
 		let node3 = Node::from_str("enode://c979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c@22.99.55.44:7770").unwrap();
+		let node4 = Node::from_str("enode://d979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c@22.99.55.44:7770").unwrap();
+		let node5 = Node::from_str("enode://e979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c@22.99.55.44:7770").unwrap();
+		let node6 = Node::from_str("enode://f979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c@22.99.55.44:7770").unwrap();
 		let id1 = H512::from_str("a979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c").unwrap();
 		let id2 = H512::from_str("b979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c").unwrap();
 		let id3 = H512::from_str("c979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c").unwrap();
+		let id4 = H512::from_str("d979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c").unwrap();
+		let id5 = H512::from_str("e979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c").unwrap();
+		let id6 = H512::from_str("f979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c").unwrap();
 		let mut table = NodeTable::new(None);
-		table.add_node(node3);
+
 		table.add_node(node1);
 		table.add_node(node2);
+		table.add_node(node3);
+		table.add_node(node4);
+		table.add_node(node5);
+		table.add_node(node6);
 
-		table.note_failure(&id1);
+		// failures - nodes 1 & 2
 		table.note_failure(&id1);
 		table.note_failure(&id2);
 
+		// success - nodes 3 & 4
+		table.note_success(&id3);
+		table.note_success(&id4);
+
+		// success - node 5 (old contact)
+		table.get_mut(&id5).unwrap().last_contact = Some(NodeContact::Success(time::UNIX_EPOCH));
+
+		// unknown - node 6
+
 		let r = table.nodes(IpFilter::default());
-		assert_eq!(r[0][..], id3[..]);
-		assert_eq!(r[1][..], id2[..]);
-		assert_eq!(r[2][..], id1[..]);
+
+		assert_eq!(r[0][..], id4[..]); // most recent success
+		assert_eq!(r[1][..], id3[..]);
+
+		// unknown (old contacts and new nodes), randomly shuffled
+		assert!(
+			r[2][..] == id5[..] && r[3][..] == id6[..] ||
+			r[2][..] == id6[..] && r[3][..] == id5[..]
+		);
+
+		assert_eq!(r[4][..], id1[..]); // oldest failure
+		assert_eq!(r[5][..], id2[..]);
 	}
 
 	#[test]
@@ -435,20 +611,27 @@ mod tests {
 		let tempdir = TempDir::new("").unwrap();
 		let node1 = Node::from_str("enode://a979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c@22.99.55.44:7770").unwrap();
 		let node2 = Node::from_str("enode://b979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c@22.99.55.44:7770").unwrap();
+		let node3 = Node::from_str("enode://c979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c@22.99.55.44:7770").unwrap();
 		let id1 = H512::from_str("a979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c").unwrap();
 		let id2 = H512::from_str("b979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c").unwrap();
+		let id3 = H512::from_str("c979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c").unwrap();
+
 		{
 			let mut table = NodeTable::new(Some(tempdir.path().to_str().unwrap().to_owned()));
 			table.add_node(node1);
 			table.add_node(node2);
-			table.note_failure(&id2);
+			table.add_node(node3);
+
+			table.note_success(&id2);
+			table.note_failure(&id3);
 		}
 
 		{
 			let table = NodeTable::new(Some(tempdir.path().to_str().unwrap().to_owned()));
 			let r = table.nodes(IpFilter::default());
-			assert_eq!(r[0][..], id1[..]);
-			assert_eq!(r[1][..], id2[..]);
+			assert_eq!(r[0][..], id2[..]); // latest success
+			assert_eq!(r[1][..], id1[..]); // unknown
+			assert_eq!(r[2][..], id3[..]); // oldest failure
 		}
 	}
 

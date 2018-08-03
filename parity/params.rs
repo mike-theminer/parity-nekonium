@@ -16,8 +16,9 @@
 
 use std::{str, fs, fmt};
 use std::time::Duration;
-use bigint::prelude::U256;
-use util::{Address, version_data};
+use ethereum_types::{U256, Address};
+use futures_cpupool::CpuPool;
+use parity_version::version_data;
 use journaldb::Algorithm;
 use ethcore::spec::{Spec, SpecParams};
 use ethcore::ethereum;
@@ -36,7 +37,7 @@ pub enum SpecType {
 	Classic,
 	Expanse,
 	Musicoin,
-	Nekonium,
+	Ellaism,
 	Dev,
 	Custom(String),
 }
@@ -60,7 +61,7 @@ impl str::FromStr for SpecType {
 			"olympic" => SpecType::Olympic,
 			"expanse" => SpecType::Expanse,
 			"musicoin" => SpecType::Musicoin,
-			"nekonium" => SpecType::Nekonium,
+			"ellaism" => SpecType::Ellaism,
 			"dev" => SpecType::Dev,
 			other => SpecType::Custom(other.into()),
 		};
@@ -78,7 +79,7 @@ impl fmt::Display for SpecType {
 			SpecType::Classic => "classic",
 			SpecType::Expanse => "expanse",
 			SpecType::Musicoin => "musicoin",
-			SpecType::Nekonium => "nekonium",
+			SpecType::Ellaism => "ellaism",
 			SpecType::Kovan => "kovan",
 			SpecType::Dev => "dev",
 			SpecType::Custom(ref custom) => custom,
@@ -97,7 +98,7 @@ impl SpecType {
 			SpecType::Classic => Ok(ethereum::new_classic(params)),
 			SpecType::Expanse => Ok(ethereum::new_expanse(params)),
 			SpecType::Musicoin => Ok(ethereum::new_musicoin(params)),
-			SpecType::Nekonium => Ok(ethereum::new_nekonium(params)),
+			SpecType::Ellaism => Ok(ethereum::new_ellaism(params)),
 			SpecType::Kovan => Ok(ethereum::new_kovan(params)),
 			SpecType::Dev => Ok(Spec::new_instant()),
 			SpecType::Custom(ref filename) => {
@@ -188,6 +189,7 @@ impl str::FromStr for ResealPolicy {
 #[derive(Debug, PartialEq)]
 pub struct AccountsConfig {
 	pub iterations: u32,
+	pub refresh_time: u64,
 	pub testnet: bool,
 	pub password_files: Vec<String>,
 	pub unlocked_accounts: Vec<Address>,
@@ -199,6 +201,7 @@ impl Default for AccountsConfig {
 	fn default() -> Self {
 		AccountsConfig {
 			iterations: 10240,
+			refresh_time: 5,
 			testnet: false,
 			password_files: Vec::new(),
 			unlocked_accounts: Vec::new(),
@@ -230,15 +233,15 @@ impl GasPricerConfig {
 impl Default for GasPricerConfig {
 	fn default() -> Self {
 		GasPricerConfig::Calibrated {
-			initial_minimum: 11904761856u64.into(),
-			usd_per_tx: 0.0025f32,
+			initial_minimum: 476190464u64.into(),
+			usd_per_tx: 0.0001f32,
 			recalibration_period: Duration::from_secs(3600),
 		}
 	}
 }
 
 impl GasPricerConfig {
-	pub fn to_gas_pricer(&self, fetch: FetchClient) -> GasPricer {
+	pub fn to_gas_pricer(&self, fetch: FetchClient, p: CpuPool) -> GasPricer {
 		match *self {
 			GasPricerConfig::Fixed(u) => GasPricer::Fixed(u),
 			GasPricerConfig::Calibrated { usd_per_tx, recalibration_period, .. } => {
@@ -247,7 +250,8 @@ impl GasPricerConfig {
 						usd_per_tx: usd_per_tx,
 						recalibration_period: recalibration_period,
 					},
-					fetch
+					fetch,
+					p,
 				)
 			}
 		}

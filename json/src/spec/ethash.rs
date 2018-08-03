@@ -16,7 +16,7 @@
 
 //! Ethash params deserialization.
 
-use uint::Uint;
+use uint::{self, Uint};
 use hash::Address;
 
 /// Deserializable doppelganger of EthashParams.
@@ -27,12 +27,15 @@ pub struct EthashParams {
 	pub minimum_difficulty: Uint,
 	/// See main EthashParams docs.
 	#[serde(rename="difficultyBoundDivisor")]
+	#[serde(deserialize_with="uint::validate_non_zero")]
 	pub difficulty_bound_divisor: Uint,
 	/// See main EthashParams docs.
 	#[serde(rename="difficultyIncrementDivisor")]
+	#[serde(default, deserialize_with="uint::validate_optional_non_zero")]
 	pub difficulty_increment_divisor: Option<Uint>,
 	/// See main EthashParams docs.
 	#[serde(rename="metropolisDifficultyIncrementDivisor")]
+	#[serde(default, deserialize_with="uint::validate_optional_non_zero")]
 	pub metropolis_difficulty_increment_divisor: Option<Uint>,
 	/// See main EthashParams docs.
 	#[serde(rename="durationLimit")]
@@ -41,10 +44,6 @@ pub struct EthashParams {
 	/// See main EthashParams docs.
 	#[serde(rename="homesteadTransition")]
 	pub homestead_transition: Option<Uint>,
-	
-	#[serde(rename="nekoniumTransition")]
-	pub nekonium_transition: Option<Uint>,	
-	
 	/// Reward per block in wei.
 	#[serde(rename="blockReward")]
 	pub block_reward: Option<Uint>,
@@ -59,11 +58,17 @@ pub struct EthashParams {
 	#[serde(rename="daoHardforkAccounts")]
 	pub dao_hardfork_accounts: Option<Vec<Address>>,
 
+
+	#[serde(rename="nekoniumTransition")]
+	pub nekonium_transition: Option<Uint>,	
+
+
 	/// See main EthashParams docs.
 	#[serde(rename="difficultyHardforkTransition")]
 	pub difficulty_hardfork_transition: Option<Uint>,
 	/// See main EthashParams docs.
 	#[serde(rename="difficultyHardforkBoundDivisor")]
+	#[serde(default, deserialize_with="uint::validate_optional_non_zero")]
 	pub difficulty_hardfork_bound_divisor: Option<Uint>,
 	/// See main EthashParams docs.
 	#[serde(rename="bombDefuseTransition")]
@@ -129,6 +134,14 @@ pub struct EthashParams {
 	/// EIP-649 base reward.
 	#[serde(rename="eip649Reward")]
 	pub eip649_reward: Option<Uint>,
+
+	/// EXPIP-2 block height
+	#[serde(rename="expip2Transition")]
+	pub expip2_transition: Option<Uint>,
+
+	/// EXPIP-2 duration limit
+	#[serde(rename="expip2DurationLimit")]
+	pub expip2_duration_limit: Option<Uint>,
 }
 
 /// Ethash engine deserialization.
@@ -142,7 +155,7 @@ pub struct Ethash {
 mod tests {
 	use serde_json;
 	use uint::Uint;
-	use bigint::prelude::{H160, U256};
+	use ethereum_types::{H160, U256};
 	use hash::Address;
 	use spec::ethash::{Ethash, EthashParams};
 
@@ -245,6 +258,8 @@ mod tests {
 				eip649_transition: None,
 				eip649_delay: None,
 				eip649_reward: None,
+				expip2_transition: None,
+				expip2_duration_limit: None,
 			}
 		});
 	}
@@ -291,7 +306,22 @@ mod tests {
 				eip649_transition: None,
 				eip649_delay: None,
 				eip649_reward: None,
+				expip2_transition: None,
+				expip2_duration_limit: None,
 			}
 		});
+	}
+
+	#[test]
+	#[should_panic(expected = "a non-zero value")]
+	fn test_zero_value_divisor() {
+		let s = r#"{
+			"params": {
+				"difficultyBoundDivisor": "0x0",
+				"minimumDifficulty": "0x020000"
+			}
+		}"#;
+
+		let _deserialized: Ethash = serde_json::from_str(s).unwrap();
 	}
 }
